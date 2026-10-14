@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# claude-update-manual: resumable, verified updates for a native Claude Code
+# install on slow or proxied links, where the built-in updater gives up
+# (anthropics/claude-code#85046: one stream, no resume, 10-minute deadline).
+#
+# Unofficial. Not affiliated with or endorsed by Anthropic.
+# MIT License. https://github.com/kuk1song/claude-update-manual
+
+set -euo pipefail
+umask 022
+
+SELF_VERSION="1.0.0"
+
+# --- constants (tests/run.sh rewrites these lines in a temporary copy) ---
+REPO="https://downloads.claude.ai/claude-code-releases"
+KEY_URL="https://downloads.claude.ai/keys/claude-code.asc"
+KEY_FPR="31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
+PROTO="=https"
+CODESIGN_REQ='anchor apple generic and certificate leaf[subject.OU] = "Q6L2SF6YDW"'
+CHECK_CODESIGN=1
+STALL_SECS=60
+# --- end constants ---
+
+FIRST_SIGNED="2.1.89"
+VER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+VERSIONS="$HOME/.local/share/claude/versions"
+LAUNCHER="$HOME/.local/bin/claude"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/claude-update-manual"
+KEYRING="$CACHE/release-key-$KEY_FPR.gpg"
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+usage: claude-update-manual [--no-zst] [latest|stable|X.Y.Z]   update (default: latest)
+       claude-update-manual --check                            show installed and available versions
+       claude-update-manual --rollback                         switch back to the previous version, offline
+       claude-update-manual --hook                             for a SessionStart hook: note when a newer version is out
+       claude-update-manual --help | --version
+
+For the native Claude Code install (~/.local/bin/claude is a symlink into
+~/.local/share/claude/versions/). Unofficial, not affiliated with Anthropic.
+EOF
+}
+
+is_version() { [[ $1 =~ $VER_RE ]]; }
+fsize() { if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
+sha256() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  else sha256sum "$1" | cut -d' ' -f1; fi
+}
+
+# On a Mac without the Command Line Tools, /usr/bin/python3 is a stub that
+# opens an install dialog, so treat it as missing.
+have_python() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  if [ "$(uname -s)" = Darwin ] && [ "$(command -v python3)" = /usr/bin/python3 ]; then
+    xcode-select -p >/dev/null 2>&1 || return 1
+  fi
+}
+py() { python3 -I - "$@"; } # -I: ignore user site-packages and PYTHON* variables
+
+curl_get() { # url -> stdout, small files only
+  curl -fsSL --proto "$PROTO" --proto-redir "$PROTO" --tlsv1.2 \
+    --connect-timeout 15 --max-time 60 "$1"
+}
+
+detect_platform() {
+  local os arch
+  case "$(uname -s)" in
+    Darwin) os=darwin ;;
+    Linux) os=linux ;;
+    *) die "unsupported OS: $(uname -s)" ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64) arch=x64 ;;
+    arm64|aarch64) arch=arm64 ;;
+    *) die "unsupported CPU: $(uname -m)" ;;
+  esac
+  # An x64 shell under Rosetta on Apple Silicon still wants the arm64 build.
+  if [ "$os" = darwin ] && [ "$arch" = x64 ] &&
+     [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" = 1 ]; then
+    arch=arm64
+  fi
+  if [ "$os" = linux ] && { [ -f /lib/libc.musl-x86_64.so.1 ] ||
+     [ -f /lib/libc.musl-aarch64.so.1 ] || ldd /bin/ls 2>&1 | grep -q musl; }; then
+    PLATFORM="linux-$arch-musl"
+  else
+    PLATFORM="$os-$arch"
+  fi
+}
+
+manifest_get() { # file platform -> "version checksum size" (empty fields when invalid)
+  py "$1" "$2" <<'PY'
+import json, re, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    p = d["platforms"][sys.argv[2]]
+    v, c, s = d["version"], p["checksum"], p["size"]
+    if not (isinstance(v, str) and isinstance(c, str) and re.fullmatch(r"[0-9a-f]{64}", c)
+            and type(s) is int and s > 0):
+        raise ValueError
+    print(v, c, s)
+except Exception:
+    print("", "", "")
+PY
+}
+
+ver_cmp() { # a b -> -1, 0 or 1
+  py "$1" "$2" <<'PY'
+import sys
+def key(v):
+    core, _, pre = v.partition("-")
+    return tuple(int(x) for x in core.split(".")), pre == "", pre
+a, b = key(sys.argv[1]), key(sys.argv[2])
+print((a > b) - (a < b))
+PY
+}
+ver_lt() { [ "$(ver_cmp "$1" "$2")" = "-1" ]; }
+
+# Update policy from the environment, ~/.claude/settings.json and the managed
+# settings file: DISABLE_UPDATES, minimumVersion, requiredMinimumVersion,
+# requiredMaximumVersion, autoUpdatesChannel. A file that exists but cannot be
+# read makes this fail, so callers stop instead of ignoring the policy.
+# Not read: managed-settings.d/, MDM profiles and server-managed settings.
+read_policy() {
+  local out
+  if ! out="$(py "$HOME/.claude/settings.json" \
+      "/Library/Application Support/ClaudeCode/managed-settings.json" \
+      "/etc/claude-code/managed-settings.json" 2>&1 <<'PY'
+import json, os, re, sys
+VER = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?")
+def key(v):
+    core, _, pre = v.partition("-")
+    return tuple(int(x) for x in core.split(".")), pre == "", pre
+def on(v):
+    return v is not None and str(v).strip().lower() not in ("", "0", "false")
+disable, channel, lows, highs = on(os.environ.get("DISABLE_UPDATES")), "latest", [], []
+for path in sys.argv[1:]:
+    if not os.path.exists(path):
+        continue
+    try:
+        d = json.load(open(path))
+    except Exception as e:
+        sys.exit(f"cannot read {path}: {e}")
+    if not isinstance(d, dict):
+        sys.exit(f"{path} is not a JSON object")
+    env = d.get("env") or {}
+    if not isinstance(env, dict):
+        sys.exit(f"{path}: env is not an object")
+    disable = disable or on(env.get("DISABLE_UPDATES"))
+    if d.get("autoUpdatesChannel") in ("latest", "stable"):
+        channel = d["autoUpdatesChannel"]
+    for k, bucket in (("minimumVersion", lows), ("requiredMinimumVersion", lows),
+                      ("requiredMaximumVersion", highs)):
+        v = d.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str) or not VER.fullmatch(v):
+            sys.exit(f"{path}: {k} is not a version")
+        bucket.append(v)
+print("1" if disable else "0", channel,
+      max(lows, key=key) if lows else "-", min(highs, key=key) if highs else "-")
+PY
+)"; then
+    POLICY_ERROR="$out"
+    return 1
+  fi
+  read -r POLICY_DISABLED POLICY_CHANNEL POLICY_MIN POLICY_MAX <<<"$out"
+}
+
+policy_allows() { # version
+  if [ "$POLICY_MIN" != "-" ] && ver_lt "$1" "$POLICY_MIN"; then
+    warn "$1 is below the configured minimum $POLICY_MIN"; return 1
+  fi
+  if [ "$POLICY_MAX" != "-" ] && ver_lt "$POLICY_MAX" "$1"; then
+    warn "$1 is above the configured maximum $POLICY_MAX"; return 1
+  fi
+}
+
+current() {
+  if [ -L "$LAUNCHER" ]; then
+    case "$(readlink "$LAUNCHER")" in
+      "$VERSIONS"/*) basename "$(readlink "$LAUNCHER")" ;;
+      *) echo "custom" ;;
+    esac
+  elif [ -e "$LAUNCHER" ]; then echo "custom"
+  else echo "none"; fi
+}
+
+# Only touch a launcher the native installer would have made.
+guard_launcher() {
+  if [ "$(current)" = custom ]; then
+    die "$LAUNCHER is a custom launcher (not a symlink into $VERSIONS); not touching it"
+  fi
+}
+
+# The lock is a symlink whose target is the owner's pid, created atomically.
+acquire_lock() {
+  mkdir -p "$CACHE"
+  LOCK="$CACHE/lock"
+  local pid
+  if [ -d "$LOCK" ] && [ ! -L "$LOCK" ]; then rm -rf "$LOCK"; fi
+  if ! ln -s "$$" "$LOCK" 2>/dev/null; then
+    pid="$(readlink "$LOCK" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      die "another claude-update-manual run is in progress (pid $pid)"
+    fi
+    if [ "$(readlink "$LOCK" 2>/dev/null || true)" = "$pid" ]; then rm -f "$LOCK"; fi
+    ln -s "$$" "$LOCK" 2>/dev/null || die "another claude-update-manual run is in progress"
+  fi
+  trap release_lock EXIT
+  trap 'exit 130' INT TERM
+}
+release_lock() {
+  if [ "$(readlink "$LOCK" 2>/dev/null || true)" = "$$" ]; then rm -f "$LOCK"; fi
+}
+
+# Fetch the release key and store it dearmored. It is trusted only because a
+# signature must also name the pinned fingerprint (checked in verify_sig).
+load_key() { # [refresh]
+  [ -s "$KEYRING" ] && [ "${1:-}" != refresh ] && return 0
+  curl_get "$KEY_URL" >"$KEYRING.asc" || { warn "could not download the release key"; return 1; }
+  py "$KEYRING.asc" "$KEYRING.tmp" <<'PY' || { rm -f "$KEYRING.asc" "$KEYRING.tmp"; return 1; }
+import base64, sys
+lines = open(sys.argv[1]).read().splitlines()
+start = lines.index("-----BEGIN PGP PUBLIC KEY BLOCK-----") + 1
+body = lines[start:lines.index("-----END PGP PUBLIC KEY BLOCK-----")]
+while body and ":" in body[0]:
+    body.pop(0)
+body = [l for l in body if l.strip() and not l.startswith("=")]
+open(sys.argv[2], "wb").write(base64.b64decode("".join(body)))
+PY
+  mv "$KEYRING.tmp" "$KEYRING"
+  rm -f "$KEYRING.asc"
+}
+
+# 0 = signature good, 1 = bad or missing, 2 = cannot check (no gpgv)
+verify_sig() { # file signature-url
+  command -v gpgv >/dev/null 2>&1 || return 2
+  curl_get "$2" >"$1.sig" 2>/dev/null || return 1
+  local pass
+  for pass in first refresh; do
+    if [ "$pass" = refresh ]; then load_key refresh || return 1; else load_key || return 1; fi
+    if gpgv --keyring "$KEYRING" --status-fd 1 "$1.sig" "$1" 2>/dev/null |
+       awk -v f="$KEY_FPR" '$2 == "VALIDSIG" && ($3 == f || $NF == f) { ok = 1 } END { exit !ok }'; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+check_codesign() { # binary
+  [ "$(uname -s)" = Darwin ] || return 0
+  [ "$CHECK_CODESIGN" = 1 ] || return 0
+  codesign --verify --strict -R="$CODESIGN_REQ" "$1" 2>/dev/null
+}
+
+smoke_test() { # binary version -> 0 if `binary --version` prints that version within 30 s
+  local out="$CACHE/smoke.$$" pid i=0
+  mkdir -p "$CACHE"
+  "$1" --version >"$out" 2>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$i" -ge 300 ]; then kill -9 "$pid" 2>/dev/null; rm -f "$out"; return 1; fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if ! wait "$pid"; then rm -f "$out"; return 1; fi
+  case "$(head -n 1 "$out")" in
+    "$2 "*|"$2") rm -f "$out"; return 0 ;;
+    *) rm -f "$out"; return 1 ;;
+  esac
+}
+
+# Resumable download. The partial file survives Ctrl-C and failed runs. curl's
+# own --retry is left off on purpose: it restarts from where that call began
+# and throws away what it received, so the loop below resumes instead.
+fetch_resumable() { # url out size label
+  local url="$1" out="$2" want="$3" label="$4" got last=-1 stalls=0 attempt rc
+  got="$(fsize "$out")"
+  if [ "$got" -gt "$want" ]; then rm -f "$out"; got=0; fi
+  if [ "$got" = "$want" ]; then say "$label already downloaded"; return 0; fi
+  say "downloading $label: $((want / 1048576)) MiB (resumable; Ctrl-C is safe, run again to continue)"
+  # A proxy that cuts long connections every few seconds can need hundreds of
+  # passes on a slow link; stop only when five passes in a row make no progress.
+  for attempt in $(seq 1 1000); do
+    rc=0
+    curl -fL --proto "$PROTO" --proto-redir "$PROTO" --tlsv1.2 --connect-timeout 20 \
+      --speed-limit 1024 --speed-time "$STALL_SECS" -C - --progress-bar -o "$out" "$url" || rc=$?
+    if [ "$rc" = 33 ]; then rm -f "$out"; fi # server refused the range: start over
+    got="$(fsize "$out")"
+    if [ "$got" = "$want" ]; then return 0; fi
+    if [ "$got" -gt "$want" ]; then rm -f "$out"; got=0; fi
+    if [ "$got" = "$last" ]; then
+      stalls=$((stalls + 1))
+      [ "$stalls" -ge 5 ] && break
+    else
+      stalls=0
+    fi
+    last="$got"
+    say "  stopped at $((got / 1048576))/$((want / 1048576)) MiB (curl exit $rc), resuming (attempt $((attempt + 1)))"
+    sleep 3
+  done
+  return 1
+}
+
+activate() { # version
+  local tmp="$LAUNCHER.cum-$$"
+  mkdir -p "$(dirname "$LAUNCHER")"
+  ln -s "$VERSIONS/$1" "$tmp"
+  mv -f "$tmp" "$LAUNCHER" # rename(2): the launcher is never missing
+}
+
+cmd_check() {
+  detect_platform
+  say "installed : $(current)"
+  local ch
+  for ch in stable latest; do
+    printf '%-9s : %s\n' "$ch" "$(curl_get "$REPO/$ch" 2>/dev/null | head -c 40 || echo '(unreachable)')"
+  done
+  say "platform  : $PLATFORM"
+  if ! have_python; then
+    say "policy    : python3 not available"
+  elif read_policy; then
+    say "policy    : DISABLE_UPDATES=$POLICY_DISABLED channel=$POLICY_CHANNEL min=$POLICY_MIN max=$POLICY_MAX"
+  else
+    say "policy    : unreadable ($POLICY_ERROR)"
+  fi
+  if command -v gpgv >/dev/null 2>&1; then say "signature : manifest checked with gpgv"
+  else say "signature : gpgv not found, manifest signature not checked"; fi
+  if [ "$(uname -s)" = Darwin ]; then say "codesign  : Anthropic Developer ID required"; fi
+  return 0
+}
+
+cmd_hook() {
+  # Never fails and never prints errors, so it cannot get in the way of a session.
+  {
+    have_python || exit 0
+    read_policy || exit 0
+    [ "$POLICY_DISABLED" = 1 ] && exit 0
+    mkdir -p "$CACHE"
+    local stamp="$CACHE/$POLICY_CHANNEL.txt" age=86400 remote local_v
+    if [ -f "$stamp" ]; then
+      age=$(( $(date +%s) - $(stat -c %Y "$stamp" 2>/dev/null || stat -f %m "$stamp" 2>/dev/null || echo 0) ))
+    fi
+    if [ "$age" -ge 86400 ]; then
+      remote="$(curl -fsS --proto "$PROTO" --max-time 3 "$REPO/$POLICY_CHANNEL" 2>/dev/null | head -c 40 | tr -d '[:space:]')" || exit 0
+      is_version "$remote" || exit 0
+      printf '%s\n' "$remote" >"$stamp.tmp" && mv "$stamp.tmp" "$stamp"
+    fi
+    remote="$(tr -d '[:space:]' <"$stamp")"
+    local_v="$(current)"
+    is_version "$remote" && is_version "$local_v" || exit 0
+    if [ "$POLICY_MAX" != "-" ] && ver_lt "$POLICY_MAX" "$remote"; then exit 0; fi
+    if ver_lt "$local_v" "$remote"; then
+      printf '{"systemMessage":"Claude Code %s is available (you are on %s). Update with: claude-update-manual %s"}\n' \
+        "$remote" "$local_v" "$POLICY_CHANNEL"
+    fi
+  } 2>/dev/null || true
+  exit 0
+}
+
+cmd_rollback() {
+  have_python || die "python3 is required"
+  read_policy || die "cannot read the update policy: $POLICY_ERROR"
+  [ "$POLICY_DISABLED" = 1 ] && die "updates are disabled by DISABLE_UPDATES"
+  guard_launcher
+  acquire_lock
+  local cur prev cand="" v p
+  cur="$(current)"
+  prev="$(cat "$CACHE/previous" 2>/dev/null || true)"
+  if is_version "$prev" && [ "$prev" != "$cur" ] && [ -s "$VERSIONS/$prev" ] &&
+     policy_allows "$prev" && smoke_test "$VERSIONS/$prev" "$prev"; then
+    cand="$prev"
+  else
+    # No usable record: the newest installed version older than the current one.
+    for v in $(for p in "$VERSIONS"/*; do printf '%s\n' "${p##*/}"; done |
+               grep -E "$VER_RE" | sort -t. -k1,1nr -k2,2nr -k3,3nr); do
+      is_version "$cur" && ! ver_lt "$v" "$cur" && continue
+      [ -s "$VERSIONS/$v" ] || continue
+      policy_allows "$v" || continue
+      smoke_test "$VERSIONS/$v" "$v" || continue
+      cand="$v"
+      break
+    done
+  fi
+  [ -n "$cand" ] || die "no working older version in $VERSIONS"
+  activate "$cand"
+  if is_version "$cur"; then printf '%s\n' "$cur" >"$CACHE/previous"; fi
+  say "rolled back: $cur -> $(current)"
+  say "Restart Claude Code to use it."
+}
+
+cmd_update() { # [--no-zst] [target]
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+  have_python || die "python3 is required"
+  local allow_zst=1 target version cur
+  if [ "${1:-}" = "--no-zst" ]; then allow_zst=0; shift; fi
+  [ $# -le 1 ] || { usage >&2; exit 2; }
+  target="${1:-latest}"
+  detect_platform
+  read_policy || die "cannot read the update policy: $POLICY_ERROR"
+  [ "$POLICY_DISABLED" = 1 ] && die "updates are disabled by DISABLE_UPDATES"
+  guard_launcher
+
+  case "$target" in
+    latest|stable)
+      version="$(curl_get "$REPO/$target" | head -c 40 | tr -d '[:space:]')" || die "could not reach $REPO/$target"
+      is_version "$version" || die "unexpected answer for channel $target"
+      say "channel $target is $version" ;;
+    *)
+      is_version "$target" || die "not a channel or version: $target (try --help)"
+      version="$target" ;;
+  esac
+  policy_allows "$version" || die "refusing $version because of the configured version policy"
+
+  cur="$(current)"
+  if [ "$version" = "$cur" ]; then say "already on $version"; return 0; fi
+
+  acquire_lock
+  mkdir -p "$VERSIONS"
+  rm -f "$VERSIONS"/.cum-* # staging files left by an interrupted run
+  find "$CACHE" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+
+  if [ -s "$VERSIONS/$version" ] && check_codesign "$VERSIONS/$version" &&
+     smoke_test "$VERSIONS/$version" "$version"; then
+    activate "$version"
+    if is_version "$cur"; then printf '%s\n' "$cur" >"$CACHE/previous"; fi
+    say "$version was already installed; activated: $cur -> $version"
+    return 0
+  fi
+
+  local work="$CACHE/$version-$PLATFORM"
+  mkdir -p "$work"
+  curl_get "$REPO/$version/manifest.json" >"$work/manifest.json" || die "could not download the manifest for $version"
+  local m_ver bin_sha bin_size sig_rc=0
+  read -r m_ver bin_sha bin_size <<<"$(manifest_get "$work/manifest.json" "$PLATFORM")"
+  [ "$m_ver" = "$version" ] || die "the manifest is for '$m_ver', not $version"
+  [ -n "$bin_sha" ] || die "the manifest has no valid entry for $PLATFORM"
+
+  verify_sig "$work/manifest.json" "$REPO/$version/manifest.json.sig" || sig_rc=$?
+  case "$sig_rc" in
+    0) say "manifest signature: OK (key $KEY_FPR)" ;;
+    1) if ver_lt "$version" "$FIRST_SIGNED"; then
+         warn "releases before $FIRST_SIGNED are not signed; relying on sha256"
+       else
+         rm -rf "$work"; die "manifest signature check failed for $version"
+       fi ;;
+    *) warn "gpgv not found: manifest signature not checked (sha256 over HTTPS still applies)" ;;
+  esac
+  say "target $version ($PLATFORM)"
+
+  local bin="$work/claude" got_bin=0
+  if [ "$allow_zst" = 1 ] && command -v zstd >/dev/null 2>&1 &&
+     curl_get "$REPO/$version/manifest.zst.json" >"$work/manifest.zst.json" 2>/dev/null; then
+    local z_ver z_sha z_size z_sig=0
+    if [ "$sig_rc" = 0 ]; then
+      verify_sig "$work/manifest.zst.json" "$REPO/$version/manifest.zst.json.sig" || z_sig=$?
+    fi
+    read -r z_ver z_sha z_size <<<"$(manifest_get "$work/manifest.zst.json" "$PLATFORM")"
+    if [ "$z_sig" != 0 ]; then
+      warn "compressed manifest signature not valid; using the uncompressed download"
+    elif [ "$z_ver" = "$version" ] && [ -n "$z_sha" ]; then
+      local zbin="$work/claude.zst"
+      if fetch_resumable "$REPO/$version/$PLATFORM/claude.zst" "$zbin" "$z_size" "claude.zst"; then
+        if [ "$(sha256 "$zbin")" = "$z_sha" ]; then
+          # Same as the official installer: the stream can carry more data after
+          # the binary, so keep exactly the size the manifest gives.
+          zstd -d -q -c "$zbin" 2>/dev/null | head -c "$bin_size" >"$bin" || true
+          if [ "$(sha256 "$bin")" = "$bin_sha" ]; then
+            say "checksums: OK (compressed and decompressed)"
+            got_bin=1
+          else
+            warn "decompressed checksum mismatch; using the uncompressed download"
+          fi
+        else
+          warn "compressed checksum mismatch; using the uncompressed download"
+        fi
+        rm -f "$zbin"
+      else
+        warn "compressed download did not finish; using the uncompressed download"
+      fi
+    fi
+  fi
+  if [ "$got_bin" != 1 ]; then
+    fetch_resumable "$REPO/$version/$PLATFORM/claude" "$bin.dl" "$bin_size" "claude" ||
+      die "the download did not finish; run the same command again to resume"
+    if [ "$(sha256 "$bin.dl")" != "$bin_sha" ]; then
+      rm -f "$bin.dl"
+      die "sha256 mismatch for the downloaded binary; the partial file was removed"
+    fi
+    mv "$bin.dl" "$bin"
+    say "checksum: OK"
+  fi
+
+  # Stage next to the final path so the last step is a rename on one filesystem,
+  # and check the staged copy, which is the file that will run.
+  local stage="$VERSIONS/.cum-$version.$$"
+  cp "$bin" "$stage"
+  chmod 755 "$stage"
+  rm -f "$bin"
+  [ "$(sha256 "$stage")" = "$bin_sha" ] || { rm -f "$stage"; die "the copy into $VERSIONS does not match the manifest"; }
+  check_codesign "$stage" || { rm -f "$stage"; die "the macOS code signature is not Anthropic's"; }
+  smoke_test "$stage" "$version" || { rm -f "$stage"; die "the new binary failed its smoke test; nothing was changed"; }
+  say "smoke test: OK"
+  mv -f "$stage" "$VERSIONS/$version"
+  activate "$version"
+  if is_version "$cur"; then printf '%s\n' "$cur" >"$CACHE/previous"; fi
+  rm -rf "$work"
+
+  say "activated: $cur -> $version"
+  say "previous version kept: $cur (claude-update-manual --rollback)"
+  say "Restart Claude Code to use the new version."
+}
+
+case "${1:-}" in
+  -h|--help) usage ;;
+  -V|--version) say "claude-update-manual $SELF_VERSION" ;;
+  --check) cmd_check ;;
+  --hook) cmd_hook ;;
+  --rollback) cmd_rollback ;;
+  --no-zst) cmd_update "$@" ;;
+  -*) usage >&2; exit 2 ;;
+  *) cmd_update "$@" ;;
+esac

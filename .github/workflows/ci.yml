@@ -1,0 +1,34 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  schedule:
+    - cron: "17 6 * * 1"
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tools
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install shellcheck zstd gnupg
+          else
+            sudo apt-get update && sudo apt-get install -y shellcheck zstd gpgv gnupg
+          fi
+      - run: shellcheck -x claude-update-manual tests/run.sh tests/live.sh
+      - name: Both READMEs have the same sections
+        run: test "$(grep -c '^## ' README.md)" = "$(grep -c '^## ' README.zh-CN.md)"
+      - run: tests/run.sh
+      - name: Tests under the bash 3.2 that ships with macOS
+        if: runner.os == 'macOS'
+        run: PATH="/bin:/usr/bin:$PATH" /bin/bash tests/run.sh
+      - name: Live signature check (read-only)
+        run: tests/live.sh
