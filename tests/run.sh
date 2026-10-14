@@ -99,9 +99,16 @@ printf '2.1.299\n' >"$ROOT/stable"
 LOG="$T/requests.log"
 : >"$LOG"
 python3 "$HERE/mock_server.py" "$ROOT" "$T/port" "$LOG" \
-  "/2.1.301/$PLAT/claude.zst,/2.1.305/$PLAT/claude" "/2.1.310/$PLAT/claude.zst" &
+  "/2.1.301/$PLAT/claude.zst,/2.1.305/$PLAT/claude" "/2.1.310/$PLAT/claude.zst" 2>"$T/server.err" &
 SERVER_PID=$!
-for _ in $(seq 1 50); do [ -s "$T/port" ] && break; sleep 0.1; done
+for _ in $(seq 1 300); do
+  [ -s "$T/port" ] && break
+  kill -0 "$SERVER_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if [ ! -s "$T/port" ]; then
+  echo "mock server did not start:"; cat "$T/server.err"; exit 1
+fi
 PORT="$(cat "$T/port")"
 
 # The copy under test: same code, constants pointed at the mock server.
